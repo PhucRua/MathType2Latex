@@ -1,18 +1,24 @@
 FROM node:20-bullseye
 
-# Ruby + toolchain để cài gem (nhanh gọn)
+# Ruby + toolchain
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ruby-full build-essential \
   && rm -rf /var/lib/apt/lists/*
 
-# 👇 Thêm pry để gem mathtype_to_mathml require được
+# Gem: cần cho converter
 RUN gem install --no-document pry mathtype_to_mathml
 
 WORKDIR /app
-COPY package.json package-lock.json* ./
-# dùng npm ci nếu có lockfile, fallback npm install
-RUN npm ci || npm install
 
+# Cài npm deps: dùng ci nếu có lockfile, ngược lại dùng install
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev; \
+    else \
+      npm install --omit=dev; \
+    fi
+
+# Source
 COPY mt2mml.rb server.js ./
 
 EXPOSE 8080
