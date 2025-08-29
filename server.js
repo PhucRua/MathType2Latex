@@ -9,15 +9,15 @@ import { execFileSync } from "child_process";
 import { XMLParser } from "fast-xml-parser";
 import mammoth from "mammoth";
 
-// Import CommonJS packages trong ESM
+// Import CommonJS trong ESM
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
-const { MathMLToLaTeX } = require("mathml-to-latex"); // CJS
-const CFB = require("cfb");                            // CJS
+const { MathMLToLaTeX } = require("mathml-to-latex");
+const CFB = require("cfb");
 
 const app = express();
 
-// ---- CORS ----
+/* ---------- CORS ---------- */
 const allow = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 app.use(cors({
@@ -27,30 +27,26 @@ app.use(cors({
   }
 }));
 
-// ---- Healthcheck ----
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ---- Upload ----
+/* ---------- Upload ---------- */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 } // 15MB
+  limits: { fileSize: 15 * 1024 * 1024 }
 });
 
-// ---- Helpers: DOCX unzip ----
-async function openDocx(buffer) {
-  return await unzipper.Open.buffer(buffer);
-}
+/* ---------- DOCX unzip helpers ---------- */
+async function openDocx(buffer) { return await unzipper.Open.buffer(buffer); }
 async function readEntry(entry) {
   const chunks = [];
   return new Promise((resolve, reject) => {
-    entry.stream()
-      .on("data", (c) => chunks.push(c))
+    entry.stream().on("data", c => chunks.push(c))
       .on("end", () => resolve(Buffer.concat(chunks)))
       .on("error", reject);
   });
 }
 
-// ---- XML helpers ----
+/* ---------- XML helpers ---------- */
 function mapRelIdToEmbedding(relsXml) {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const rels = parser.parse(relsXml)?.Relationships?.Relationship || [];
@@ -71,7 +67,7 @@ function findOleRelIds(documentXml) {
     for (const k of Object.keys(obj)) {
       const v = obj[k];
       if (k === "o:OLEObject" && v?.["r:id"]) ids.add(v["r:id"]);
-      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]); // đôi khi dùng VML
+      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]);
       if (typeof v === "object") walk(v);
     }
   })(doc);
@@ -92,54 +88,90 @@ function mapProgIdFromDocXml(documentXml) {
       if (typeof v === "object") walk(v);
     }
   })(doc);
-  return map; // {'rId6':'Equation.DSMT4', ...}
+  return map;
 }
 
-// ---- Debug: liệt kê stream OLE ----
+/* ---------- Debug: list streams ---------- */
 function listCfbStreams(binBuffer) {
   try {
     const cf = CFB.read(binBuffer, { type: "buffer" });
     return cf.FileIndex.filter(fi => fi.content).map(fi => ({
       name: fi.name, size: (fi.content?.length || 0)
-    })).slice(0, 20);
+    })).slice(0, 30);
   } catch { return []; }
 }
 
-// ---- Nhận diện MTEF “hợp lý” ----
+/* ---------- Heuristics: MTEF ---------- */
 function isLikelyMTEF(buf) {
   if (!buf || buf.length < 4) return false;
   const major = buf[0], platform = buf[1];
   return major >= 2 && major <= 8 && platform >= 0 && platform <= 7;
 }
 
-// ---- Bóc MTEF từ OLE (ưu tiên MathType DSMT4 / “Equation Native”) ----
+/* Parse stream Ole10Native → trả payload gốc (thường là bytes MTEF hoặc file nhúng) */
+function extractFromOle10Native(buf) {
+  const b = Buffer.from(buf);
+  function tryFrom(off) {
+    try {
+      let i = off;
+      const readZ = () => {
+        let j = i;
+        while (j < b.length && b[j] !== 0) j++;
+        const s = b.subarray(i, j).toString("binary");
+        i = j + 1; // skip NUL
+        return s;
+      };
+      /* format: [name]\0 [src]\0 [temp]\0 [DWORD len] [data...] */
+      const _name = readZ();
+      const _src  = readZ();
+      const _tmp  = readZ();
+      if (i + 4 > b.length) return null;
+      const len = b.readUInt32LE(i); i += 4;
+      if (len > 0 && i + len <= b.length) {
+        return b.subarray(i, i + len);
+      }
+      return null;
+    } catch { return null; }
+  }
+  return tryFrom(0) || tryFrom(4) || tryFrom(6);
+}
+
+/* ---------- Extract MTEF from OLE ---------- */
 function extractMTEFFromOLE(binBuffer, progId = "") {
   let cf = null;
   try { cf = CFB.read(binBuffer, { type: "buffer" }); } catch { cf = null; }
 
+  // 1) Ưu tiên các stream MathType quen thuộc
   const CANDIDATE_RX = [
-    /Equation Native/i,       // phổ biến nhất
+    /Equation Native/i,
     /MathType Equation/i,
     /Mathtype Equation/i,
     /^Equation$/i,
     /EqnData/i,
     /Equation Data/i
   ];
-
-  // 1) Nếu parse được CFB → thử các stream ưu tiên (không cắt “MTEF” để tránh hỏng data)
   if (cf) {
     for (const rx of CANDIDATE_RX) {
       const hit = cf.FileIndex.find(fi => fi.content && rx.test(fi.name));
       if (hit) {
         const buf = Buffer.from(hit.content);
         if (isLikelyMTEF(buf)) return buf;
-        const sig = Buffer.from("MTEF");
-        const j = buf.indexOf(sig);
+        const j = buf.indexOf(Buffer.from("MTEF"));
         if (j >= 0 && isLikelyMTEF(buf.subarray(j + 4))) return buf.subarray(j + 4);
-        return buf; // để Ruby thử parse “as-is”
+        return buf; // để Ruby tự parse
       }
     }
-    // 2) Quét tất cả stream để tìm vùng “giống MTEF”
+    // 2) Thử stream Ole10Native (rất hay gặp với DSMT4)
+    const ole10 = cf.FileIndex.find(fi => fi.content && /^\x01Ole10Native$/i.test(fi.name));
+    if (ole10) {
+      const payload = extractFromOle10Native(ole10.content);
+      if (payload) {
+        if (isLikelyMTEF(payload)) return payload;
+        const k = payload.indexOf(Buffer.from("MTEF"));
+        if (k >= 0 && isLikelyMTEF(payload.subarray(k + 4))) return payload.subarray(k + 4);
+      }
+    }
+    // 3) Quét tất cả stream tìm byte-pattern giống MTEF
     for (const fi of cf.FileIndex) {
       if (!fi.content) continue;
       const buf = Buffer.from(fi.content);
@@ -149,7 +181,7 @@ function extractMTEFFromOLE(binBuffer, progId = "") {
     }
   }
 
-  // 3) Fallback: tìm trong toàn bộ .bin (khi không phải CFB chuẩn)
+  // 4) Fallback: quét ngoài .bin
   try {
     const b = Buffer.from(binBuffer);
     if (isLikelyMTEF(b)) return b;
@@ -160,7 +192,7 @@ function extractMTEFFromOLE(binBuffer, progId = "") {
   return null;
 }
 
-// ---- Chuyển MTEF → MathML → LaTeX ----
+/* ---------- Convert ---------- */
 function convertMtefBinToMathMLAndTeX(binBuffer, tmpName, progId) {
   const mtef = extractMTEFFromOLE(binBuffer, progId);
   if (!mtef) {
@@ -200,23 +232,21 @@ function convertMtefBinToMathMLAndTeX(binBuffer, tmpName, progId) {
   return { mathml, latex, error, error_detail };
 }
 
-// ---- API chính ----
+/* ---------- API ---------- */
 app.post("/convert", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const directory = await openDocx(req.file.buffer);
-
     const docEntry = directory.files.find(f => f.path === "word/document.xml");
     const relEntry = directory.files.find(f => f.path === "word/_rels/document.xml.rels");
     const docXml = docEntry ? (await readEntry(docEntry)).toString("utf8") : "";
     const relXml = relEntry ? (await readEntry(relEntry)).toString("utf8") : "";
 
-    const relMap   = relXml ? mapRelIdToEmbedding(relXml) : {};
+    const relMap    = relXml ? mapRelIdToEmbedding(relXml) : {};
     const oleRelIds = findOleRelIds(docXml);
     const progIdMap = docXml ? mapProgIdFromDocXml(docXml) : {};
 
-    // Toàn bộ OLE nhị phân
     const bins = {};
     for (const file of directory.files) {
       if (file.path.startsWith("word/embeddings/") && file.path.endsWith(".bin")) {
@@ -224,7 +254,6 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       }
     }
 
-    // Chuyển từng OLE → MathML/LaTeX
     const equations = [];
     for (const rId of oleRelIds) {
       const embPath = relMap[rId];
@@ -233,7 +262,6 @@ app.post("/convert", upload.single("file"), async (req, res) => {
         const progId = progIdMap[rId] || "";
         const { mathml, latex, error, error_detail } =
           convertMtefBinToMathMLAndTeX(bins[embPath], name, progId);
-
         equations.push({
           rId, embPath, name, progId,
           mathml, latex, error, error_detail,
@@ -242,7 +270,6 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       }
     }
 
-    // HTML fallback toàn văn (không render công thức)
     const htmlResult = await mammoth.convertToHtml({ buffer: req.file.buffer });
     const html = htmlResult.value || "";
 
