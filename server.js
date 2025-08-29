@@ -9,14 +9,15 @@ import { execFileSync } from "child_process";
 import { XMLParser } from "fast-xml-parser";
 import mammoth from "mammoth";
 
-// ✅ Import CommonJS trong file ESM
+// Import CJS trong ESM
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
-const { MathMLToLaTeX } = require("mathml-to-latex"); // ← dùng require để lấy named export CJS
+const { MathMLToLaTeX } = require("mathml-to-latex");
+const CFB = require("cfb"); // <— parser OLE/Compound File
 
 const app = express();
 
-// CORS whitelist qua env ALLOWED_ORIGINS (phân tách dấu phẩy). Trống = allow all (dev).
+// CORS whitelist (để trống = allow all cho dev)
 const allow = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -50,18 +51,65 @@ async function readEntry(entry) {
   });
 }
 
+/** Tìm và trả về phần MTEF “sạch” bên trong OLE .bin */
+function extractMTEFFromOLE(binBuffer) {
+  // 1) Thử parse chuẩn bằng CFB
+  try {
+    const cf = CFB.read(binBuffer, { type: "buffer" });
+    // Các tên stream phổ biến chứa dữ liệu MathType
+    const PATTERN = /Equation Native|MathType Equation|Mathtype Equation|Equation|MTEquation|MTEF/i;
+
+    // Tìm stream khớp
+    const entry = cf.FileIndex.find(fi => PATTERN.test(fi.name));
+    if (entry && entry.content) {
+      let buf = Buffer.from(entry.content); // Uint8Array -> Buffer
+      // Trong stream này thường có “MTEF” ở đâu đó, cắt từ vị trí đó
+      const sig = Buffer.from("MTEF");
+      const idx = buf.indexOf(sig);
+      if (idx >= 0) return buf.subarray(idx);
+      // Nếu không thấy “MTEF”, có thể stream đã là MTEF thuần → trả nguyên
+      return buf;
+    }
+  } catch (e) {
+    // bỏ qua, fallback bên dưới
+  }
+
+  // 2) Fallback: tìm trực tiếp “MTEF” trong toàn bộ .bin
+  try {
+    const buf = Buffer.from(binBuffer);
+    const sig = Buffer.from("MTEF");
+    const idx = buf.indexOf(sig);
+    if (idx >= 0) return buf.subarray(idx);
+  } catch (e) {
+    // ignore
+  }
+
+  return null; // không tìm thấy MTEF
+}
+
 function convertMtefBinToMathMLAndTeX(binBuffer, tmpName) {
+  // Bóc MTEF
+  const mtef = extractMTEFFromOLE(binBuffer);
+  if (!mtef) {
+    return { mathml: "", latex: "", error: "no_mtef_found" };
+  }
+
+  // Ghi ra file tạm để Ruby gem đọc
   const tmpPath = path.join(os.tmpdir(), tmpName);
-  fs.writeFileSync(tmpPath, binBuffer);
+  fs.writeFileSync(tmpPath, mtef);
 
   let mathml = "";
+  let error = "";
   try {
-    // Gọi script Ruby dùng gem mathtype_to_mathml (chuyển MTEF → MathML)
     mathml = execFileSync("ruby", [path.join(process.cwd(), "mt2mml.rb"), tmpPath], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"]
     });
+    if (!mathml || !mathml.trim().startsWith("<")) {
+      error = "converter_empty_mathml";
+    }
   } catch (e) {
+    error = "ruby_converter_error";
     mathml = "";
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
@@ -70,10 +118,14 @@ function convertMtefBinToMathMLAndTeX(binBuffer, tmpName) {
   let latex = "";
   if (mathml && mathml.trim().startsWith("<")) {
     try {
-      latex = MathMLToLaTeX.convert(mathml); // ✅ dùng API đúng của gói
-    } catch {}
+      latex = MathMLToLaTeX.convert(mathml);
+    } catch (e) {
+      // nếu lỗi chuyển LaTeX, vẫn trả MathML
+      error = error || "latex_convert_failed";
+    }
   }
-  return { mathml, latex };
+
+  return { mathml, latex, error };
 }
 
 function mapRelIdToEmbedding(relsXml) {
@@ -89,7 +141,7 @@ function mapRelIdToEmbedding(relsXml) {
 }
 
 function findOleRelIds(documentXml) {
-  // Tìm r:id của OLE MathType trong document.xml
+  // Tìm r:id của đối tượng OLE MathType (trong document.xml)
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const doc = parser.parse(documentXml);
   const ids = new Set();
@@ -99,7 +151,7 @@ function findOleRelIds(documentXml) {
     for (const k of Object.keys(obj)) {
       const v = obj[k];
       if (k === "o:OLEObject" && v?.["r:id"]) ids.add(v["r:id"]);
-      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]); // một số file dùng VML
+      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]); // 1 số case dùng VML
       if (typeof v === "object") walk(v);
     }
   }
@@ -136,8 +188,8 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       const embPath = relMap[rId];
       if (embPath && bins[embPath]) {
         const name = path.basename(embPath);
-        const { mathml, latex } = convertMtefBinToMathMLAndTeX(bins[embPath], name);
-        equations.push({ rId, embPath, name, mathml, latex });
+        const { mathml, latex, error } = convertMtefBinToMathMLAndTeX(bins[embPath], name);
+        equations.push({ rId, embPath, name, mathml, latex, error });
       }
     }
 
@@ -145,7 +197,12 @@ app.post("/convert", upload.single("file"), async (req, res) => {
     const htmlResult = await mammoth.convertToHtml({ buffer: req.file.buffer });
     const html = htmlResult.value || "";
 
-    res.json({ ok: true, count: equations.length, equations, htmlFallback: html });
+    res.json({
+      ok: true,
+      count: equations.length,
+      equations,
+      htmlFallback: html
+    });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
