@@ -145,7 +145,7 @@ function buildInlineHtml(documentXml, equations){
   const eqByRid = {};
   (equations||[]).forEach(e => { if (e && e.rId) eqByRid[e.rId] = e; });
 
-  // ép mọi MathML về inline
+  // Ép mọi MathML về inline
   const forceInlineMathML = (mml) =>
     String(mml)
       .replace(/<math\b([^>]*?)display="block"/gi,'<math$1display="inline"')
@@ -158,7 +158,7 @@ function buildInlineHtml(documentXml, equations){
   const renderEqInline = (eq, rid) => {
     if (eq && eq.latex && eq.latex.trim()){
       const tex = eq.latex;
-      // INLINE: \( ... \)
+      // INLINE render với \( ... \)
       return `<span class="eq-inline" data-tex="${escAttr(tex)}">\\(${escHtml(tex)}\\)</span>`;
     }
     if (eq && eq.mathml && eq.mathml.trim()){
@@ -198,7 +198,7 @@ function buildInlineHtml(documentXml, equations){
       out.push(renderEqInline(eqByRid[rid], rid)); return;
     }
 
-    // Walk children (đảm bảo thứ tự đoạn/run)
+    // Walk children
     if (node["w:p"]) toArr(node["w:p"]).forEach(ch => walk(ch, out));
     if (node["w:r"]) toArr(node["w:r"]).forEach(ch => walk(ch, out));
 
@@ -227,6 +227,86 @@ function buildInlineHtml(documentXml, equations){
   </style>
   ${htmlOut.join("\n")}
   `;
+}
+
+/* ---------------- Build plain text: chèn công thức $...$ ---------------- */
+function buildPlainText(documentXml, equations){
+  const parser = new XMLParser({ ignoreAttributes:false, attributeNamePrefix:"" });
+  const root = parser.parse(documentXml);
+
+  const eqByRid = {};
+  (equations||[]).forEach(e => { if (e && e.rId) eqByRid[e.rId] = e; });
+
+  const body = root?.["w:document"]?.["w:body"];
+  const paras = toArr(body?.["w:p"]);
+  const lines = [];
+
+  const renderEqText = (eq) => {
+    if (eq && eq.latex && eq.latex.trim()){
+      // INLINE plain text: $ ... $
+      return `$${eq.latex}$`;
+    }
+    if (eq && eq.mathml && eq.mathml.trim()){
+      // Nếu không convert được LaTeX, để placeholder (có thể thay bằng chuyển đổi khác nếu muốn)
+      return `[MATHML]`;
+    }
+    return `[MATH?]`;
+  };
+
+  const walk = (node, outArr) => {
+    if (node == null) return;
+
+    if (typeof node === "string") { outArr.push(node); return; }
+
+    // Text run
+    if (node["w:t"] != null) {
+      const wt = node["w:t"];
+      if (Array.isArray(wt)) wt.forEach(x => outArr.push(textOf(x)));
+      else outArr.push(textOf(wt));
+      return;
+    }
+
+    // Break / tab
+    if (node["w:br"] != null) outArr.push("\n");
+    if (node["w:tab"] != null) outArr.push("\t");
+
+    // OLE patterns
+    if (node["w:object"] && node["w:object"]["o:OLEObject"]) {
+      const rid = node["w:object"]["o:OLEObject"]["r:id"] || node["w:object"]["o:OLEObject"]["r:linkByRef"];
+      outArr.push(renderEqText(eqByRid[rid])); return;
+    }
+    if (node["w:pict"] && node["w:pict"]["v:imagedata"] && node["w:pict"]["v:imagedata"]["r:id"]) {
+      const rid = node["w:pict"]["v:imagedata"]["r:id"];
+      outArr.push(renderEqText(eqByRid[rid])); return;
+    }
+    if (node["o:OLEObject"] && (node["o:OLEObject"]["r:id"] || node["o:OLEObject"]["r:linkByRef"])) {
+      const rid = node["o:OLEObject"]["r:id"] || node["o:OLEObject"]["r:linkByRef"];
+      outArr.push(renderEqText(eqByRid[rid])); return;
+    }
+
+    // Walk children
+    if (node["w:p"]) toArr(node["w:p"]).forEach(ch => walk(ch, outArr));
+    if (node["w:r"]) toArr(node["w:r"]).forEach(ch => walk(ch, outArr));
+
+    for (const k of Object.keys(node)) {
+      if (k === "w:p" || k === "w:r" || k === "w:t" || k === "w:br" || k === "w:tab" ||
+          k === "w:object" || k === "w:pict" || k === "o:OLEObject") continue;
+      const v = node[k];
+      if (typeof v === "object") {
+        if (Array.isArray(v)) v.forEach(ch => walk(ch, outArr));
+        else walk(v, outArr);
+      }
+    }
+  };
+
+  for (const p of paras) {
+    const buf = [];
+    walk(p, buf);
+    // Gộp chuỗi, rút gọn khoảng trắng đa ký tự về 1 khoảng (nhẹ nhàng, tránh dính từ)
+    const line = buf.join("").replace(/\u00A0/g, " ");
+    lines.push(line);
+  }
+  return lines.join("\n\n");
 }
 
 /* ---------------- API ---------------- */
@@ -269,12 +349,13 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       }
     }
 
-    // Fallback HTML + Inline HTML
-    const htmlResult = await mammoth.convertToHtml({ buffer: req.file.buffer });
+    // Fallback HTML + Inline HTML + Plain Text
+    const htmlResult  = await mammoth.convertToHtml({ buffer: req.file.buffer });
     const htmlFallback = htmlResult.value || "";
-    const inlineHtml = buildInlineHtml(docXml, equations);
+    const inlineHtml   = buildInlineHtml(docXml, equations);
+    const plainText    = buildPlainText(docXml, equations);
 
-    res.json({ ok: true, count: equations.length, equations, htmlFallback, inlineHtml });
+    res.json({ ok: true, count: equations.length, equations, htmlFallback, inlineHtml, plainText });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
