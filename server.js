@@ -6,13 +6,17 @@ import os from "os";
 import path from "path";
 import unzipper from "unzipper";
 import { execFileSync } from "child_process";
-import { Mathml2latex } from "mathml-to-latex"; // ✅ đúng gói & đúng API
 import { XMLParser } from "fast-xml-parser";
 import mammoth from "mammoth";
 
+// ✅ Import CommonJS trong file ESM
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const { MathMLToLaTeX } = require("mathml-to-latex"); // ← dùng require để lấy named export CJS
+
 const app = express();
 
-// CORS whitelist qua env ALLOWED_ORIGINS (phân tách dấu phẩy). Để trống = cho phép tất cả (dev).
+// CORS whitelist qua env ALLOWED_ORIGINS (phân tách dấu phẩy). Trống = allow all (dev).
 const allow = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -66,7 +70,7 @@ function convertMtefBinToMathMLAndTeX(binBuffer, tmpName) {
   let latex = "";
   if (mathml && mathml.trim().startsWith("<")) {
     try {
-      latex = Mathml2latex.convert(mathml); // ✅ dùng API đúng của gói
+      latex = MathMLToLaTeX.convert(mathml); // ✅ dùng API đúng của gói
     } catch {}
   }
   return { mathml, latex };
@@ -141,12 +145,7 @@ app.post("/convert", upload.single("file"), async (req, res) => {
     const htmlResult = await mammoth.convertToHtml({ buffer: req.file.buffer });
     const html = htmlResult.value || "";
 
-    res.json({
-      ok: true,
-      count: equations.length,
-      equations,
-      htmlFallback: html
-    });
+    res.json({ ok: true, count: equations.length, equations, htmlFallback: html });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
