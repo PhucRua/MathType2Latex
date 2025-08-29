@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: docx-mt2tex
+    env: docker
+    region: singapore
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALLOWED_ORIGINS
+        value: https://script.google.com,https://script.googleusercontent.com
