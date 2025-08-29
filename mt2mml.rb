@@ -1,5 +1,9 @@
-# Chuyển nhị phân MathType (MTEF) → MathML
-# gem cần: gem install mathtype_to_mathml
+# mt2mml.rb
 require 'mathtype_to_mathml'
-bin = File.binread(ARGV[0])
-puts MathTypeToMathML::Converter.new(bin).convert
+
+# Gem kỳ vọng FILE PATH, không phải bytes
+path = ARGV[0]
+abort "usage: ruby mt2mml.rb <oleObject*.bin>" unless path && File.exist?(path)
+
+# Trả về MathML (string)
+puts MathTypeToMathML::Converter.new(path).convert
