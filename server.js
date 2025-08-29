@@ -12,12 +12,12 @@ import mammoth from "mammoth";
 // Import CommonJS packages trong ESM
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
-const { MathMLToLaTeX } = require("mathml-to-latex"); // CJS
-const CFB = require("cfb");                            // CJS
+const { MathMLToLaTeX } = require("mathml-to-latex");
+const CFB = require("cfb");
 
 const app = express();
 
-/* ---------- CORS ---------- */
+/* --------- CORS --------- */
 const allow = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 app.use(cors({
@@ -29,13 +29,18 @@ app.use(cors({
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-/* ---------- Upload ---------- */
+/* --------- Upload --------- */
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 } // 15MB
+  limits: { fileSize: 15 * 1024 * 1024 }
 });
 
-/* ---------- DOCX unzip helpers ---------- */
+/* --------- Utils --------- */
+function toArr(x){ return Array.isArray(x) ? x : (x==null ? [] : [x]); }
+function escHtml(s){ return String(s).replace(/[&<>]/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
+function escAttr(s){ return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;'); }
+
+/* --------- DOCX unzip helpers --------- */
 async function openDocx(buffer) { return await unzipper.Open.buffer(buffer); }
 async function readEntry(entry) {
   const chunks = [];
@@ -46,7 +51,7 @@ async function readEntry(entry) {
   });
 }
 
-/* ---------- XML helpers ---------- */
+/* --------- XML helpers --------- */
 function mapRelIdToEmbedding(relsXml) {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const rels = parser.parse(relsXml)?.Relationships?.Relationship || [];
@@ -58,7 +63,6 @@ function mapRelIdToEmbedding(relsXml) {
   });
   return map;
 }
-
 function findOleRelIds(documentXml) {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const doc = parser.parse(documentXml);
@@ -68,13 +72,12 @@ function findOleRelIds(documentXml) {
     for (const k of Object.keys(obj)) {
       const v = obj[k];
       if (k === "o:OLEObject" && v?.["r:id"]) ids.add(v["r:id"]);
-      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]); // đôi khi dùng VML
+      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]); // VML fallback
       if (typeof v === "object") walk(v);
     }
   })(doc);
   return Array.from(ids);
 }
-
 function mapProgIdFromDocXml(documentXml) {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const doc = parser.parse(documentXml);
@@ -90,10 +93,10 @@ function mapProgIdFromDocXml(documentXml) {
       if (typeof v === "object") walk(v);
     }
   })(doc);
-  return map; // {'rId6':'Equation.DSMT4', ...}
+  return map;
 }
 
-/* ---------- Debug: liệt kê stream OLE ---------- */
+/* --------- Debug: list streams of OLE --------- */
 function listCfbStreams(binBuffer) {
   try {
     const cf = CFB.read(binBuffer, { type: "buffer" });
@@ -103,11 +106,7 @@ function listCfbStreams(binBuffer) {
   } catch { return []; }
 }
 
-/* ---------- Convert: OLE .bin → MathML → LaTeX ---------- */
-/**
- * Ghi nguyên OLE .bin ra file tạm và gọi Ruby:
- * mt2mml.rb nhận đường dẫn file OLE, tự parse OLE + MTEF bên trong.
- */
+/* --------- Convert: OLE .bin → MathML → LaTeX --------- */
 function convertOleBinToMathMLAndTeX(oleBinBuffer, tmpName) {
   const tmpPath = path.join(os.tmpdir(), tmpName);
   fs.writeFileSync(tmpPath, oleBinBuffer);
@@ -118,14 +117,10 @@ function convertOleBinToMathMLAndTeX(oleBinBuffer, tmpName) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"]
     });
-    if (!mathml || !mathml.trim().startsWith("<")) {
-      error = "converter_empty_mathml";
-    }
+    if (!mathml || !mathml.trim().startsWith("<")) error = "converter_empty_mathml";
   } catch (e) {
     error = "ruby_converter_error";
-    try {
-      error_detail = (e && (e.stderr ? e.stderr.toString("utf8") : e.message || "")) || "";
-    } catch { error_detail = ""; }
+    try { error_detail = (e && (e.stderr ? e.stderr.toString("utf8") : e.message || "")) || ""; } catch {}
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
   }
@@ -134,18 +129,85 @@ function convertOleBinToMathMLAndTeX(oleBinBuffer, tmpName) {
     try { latex = MathMLToLaTeX.convert(mathml); }
     catch { error = error || "latex_convert_failed"; }
   }
-
   return { mathml, latex, error, error_detail };
 }
 
-/* ---------- API ---------- */
+/* --------- Build inline HTML: chèn công thức đúng vị trí --------- */
+function buildInlineHtml(documentXml, equations){
+  const parser = new XMLParser({ ignoreAttributes:false, attributeNamePrefix:"" });
+  const root = parser.parse(documentXml);
+  const eqByRid = {};
+  (equations||[]).forEach(e => { if (e.rId) eqByRid[e.rId] = e; });
+
+  const body = root?.["w:document"]?.["w:body"];
+  const paras = toArr(body?.["w:p"]);
+  const html = [];
+
+  const walk = (node, out) => {
+    if (node == null) return;
+    if (typeof node === "string") { out.push(escHtml(node)); return; }
+    if (typeof node !== "object") return;
+
+    // Nếu gặp OLE → chèn công thức
+    const ole = node["o:OLEObject"];
+    if (ole && (ole["r:id"] || ole["r:linkByRef"])) {
+      const rid = ole["r:id"] || ole["r:linkByRef"];
+      const eq = eqByRid[rid];
+      if (eq) {
+        if (eq.latex && eq.latex.trim()){
+          const tex = eq.latex;
+          out.push(`<span class="eq-inline" data-tex="${escAttr(tex)}">$$${escHtml(tex)}$$</span>`);
+        } else if (eq.mathml && eq.mathml.trim()){
+          out.push(`<span class="eq-inline" data-has-mml="1">${eq.mathml}</span>`);
+        } else {
+          out.push(`<span class="eq-inline-missing" title="${escAttr(eq.error||'missing')}">[công thức lỗi]</span>`);
+        }
+      } else {
+        out.push(`<span class="eq-inline-missing" title="${escAttr(rid)}">[công thức?]</span>`);
+      }
+      return;
+    }
+
+    // Text/run cơ bản
+    if (node["w:t"] != null) { out.push(escHtml(node["w:t"])); return; }
+    if (node["w:br"] != null) out.push("<br/>");
+    if (node["w:tab"] != null) out.push("&emsp;");
+
+    // Duyệt tiếp
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (k === "w:p" || k === "w:r") {
+        toArr(v).forEach(child => walk(child, out));
+      } else if (typeof v === "object") {
+        if (Array.isArray(v)) v.forEach(child => walk(child, out));
+        else walk(v, out);
+      }
+    }
+  };
+
+  for (const p of paras) {
+    const buf = [];
+    walk(p, buf);
+    const content = buf.join("").replace(/\s+$/,"");
+    html.push(`<p>${content || "&nbsp;"}</p>`);
+  }
+
+  return `
+  <style>
+    .eq-inline{padding:2px 4px;border-radius:6px}
+    .eq-inline code{background:#0b1020;color:#d1e7ff;border-radius:6px;padding:4px 6px}
+    .eq-inline-missing{color:#dc2626;border-bottom:1px dotted #dc2626}
+  </style>
+  ${html.join("\n")}
+  `;
+}
+
+/* --------- API --------- */
 app.post("/convert", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const directory = await openDocx(req.file.buffer);
-
-    // Đọc document + relationships
     const docEntry = directory.files.find(f => f.path === "word/document.xml");
     const relEntry = directory.files.find(f => f.path === "word/_rels/document.xml.rels");
     const docXml = docEntry ? (await readEntry(docEntry)).toString("utf8") : "";
@@ -155,7 +217,7 @@ app.post("/convert", upload.single("file"), async (req, res) => {
     const oleRelIds = findOleRelIds(docXml);
     const progIdMap = docXml ? mapProgIdFromDocXml(docXml) : {};
 
-    // Tập OLE .bin
+    // Thu thập các OLE .bin
     const bins = {};
     for (const file of directory.files) {
       if (file.path.startsWith("word/embeddings/") && file.path.endsWith(".bin")) {
@@ -163,7 +225,7 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       }
     }
 
-    // Chuyển từng đối tượng OLE
+    // Convert từng OLE
     const equations = [];
     for (const rId of oleRelIds) {
       const embPath = relMap[rId];
@@ -180,11 +242,12 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       }
     }
 
-    // HTML fallback của cả tài liệu (không render công thức)
+    // Fallback HTML + Inline HTML
     const htmlResult = await mammoth.convertToHtml({ buffer: req.file.buffer });
-    const html = htmlResult.value || "";
+    const htmlFallback = htmlResult.value || "";
+    const inlineHtml = buildInlineHtml(docXml, equations);
 
-    res.json({ ok: true, count: equations.length, equations, htmlFallback: html });
+    res.json({ ok: true, count: equations.length, equations, htmlFallback, inlineHtml });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
