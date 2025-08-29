@@ -6,13 +6,13 @@ import os from "os";
 import path from "path";
 import unzipper from "unzipper";
 import { execFileSync } from "child_process";
-import { MathMLToLaTeX } from "mathml-to-latex";
+import { Mathml2latex } from "mathml-to-latex"; // ✅ đúng gói & đúng API
 import { XMLParser } from "fast-xml-parser";
 import mammoth from "mammoth";
 
 const app = express();
 
-// CORS whitelist qua biến môi trường ALLOWED_ORIGINS (phân tách dấu phẩy)
+// CORS whitelist qua env ALLOWED_ORIGINS (phân tách dấu phẩy). Để trống = cho phép tất cả (dev).
 const allow = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -49,9 +49,10 @@ async function readEntry(entry) {
 function convertMtefBinToMathMLAndTeX(binBuffer, tmpName) {
   const tmpPath = path.join(os.tmpdir(), tmpName);
   fs.writeFileSync(tmpPath, binBuffer);
+
   let mathml = "";
   try {
-    // Gọi script Ruby dùng gem mathtype_to_mathml
+    // Gọi script Ruby dùng gem mathtype_to_mathml (chuyển MTEF → MathML)
     mathml = execFileSync("ruby", [path.join(process.cwd(), "mt2mml.rb"), tmpPath], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"]
@@ -61,9 +62,12 @@ function convertMtefBinToMathMLAndTeX(binBuffer, tmpName) {
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
   }
+
   let latex = "";
   if (mathml && mathml.trim().startsWith("<")) {
-    try { latex = MathMLToLaTeX.convert(mathml); } catch {}
+    try {
+      latex = Mathml2latex.convert(mathml); // ✅ dùng API đúng của gói
+    } catch {}
   }
   return { mathml, latex };
 }
@@ -81,7 +85,7 @@ function mapRelIdToEmbedding(relsXml) {
 }
 
 function findOleRelIds(documentXml) {
-  // Tìm r:id của OLE MathType trong XML
+  // Tìm r:id của OLE MathType trong document.xml
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const doc = parser.parse(documentXml);
   const ids = new Set();
@@ -90,10 +94,8 @@ function findOleRelIds(documentXml) {
     if (!obj || typeof obj !== "object") return;
     for (const k of Object.keys(obj)) {
       const v = obj[k];
-      // OLE object
       if (k === "o:OLEObject" && v?.["r:id"]) ids.add(v["r:id"]);
-      // Một số file nhúng qua VML imagedata (ít gặp)
-      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]);
+      if (k === "v:imagedata" && v?.["r:id"]) ids.add(v["r:id"]); // một số file dùng VML
       if (typeof v === "object") walk(v);
     }
   }
