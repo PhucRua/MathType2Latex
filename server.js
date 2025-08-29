@@ -68,7 +68,6 @@ function mapRelIdToEmbedding(relsXml) {
   });
   return map;
 }
-
 function findOleRelIds(documentXml) {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const doc = parser.parse(documentXml);
@@ -84,7 +83,6 @@ function findOleRelIds(documentXml) {
   })(doc);
   return Array.from(ids);
 }
-
 function mapProgIdFromDocXml(documentXml) {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const doc = parser.parse(documentXml);
@@ -139,14 +137,19 @@ function convertOleBinToMathMLAndTeX(oleBinBuffer, tmpName) {
   return { mathml, latex, error, error_detail };
 }
 
-/* ---------------- Build inline HTML: chèn công thức đúng vị trí ---------------- */
+/* ---------------- Build inline HTML: chèn công thức đúng vị trí (INLINE) ---------------- */
 function buildInlineHtml(documentXml, equations){
   const parser = new XMLParser({ ignoreAttributes:false, attributeNamePrefix:"" });
   const root = parser.parse(documentXml);
 
-  // rId -> equation
   const eqByRid = {};
   (equations||[]).forEach(e => { if (e && e.rId) eqByRid[e.rId] = e; });
+
+  // ép mọi MathML về inline
+  const forceInlineMathML = (mml) =>
+    String(mml)
+      .replace(/<math\b([^>]*?)display="block"/gi,'<math$1display="inline"')
+      .replace(/<math\b(?![^>]*display=)/gi,'<math display="inline"');
 
   const body = root?.["w:document"]?.["w:body"];
   const paras = toArr(body?.["w:p"]);
@@ -155,10 +158,11 @@ function buildInlineHtml(documentXml, equations){
   const renderEqInline = (eq, rid) => {
     if (eq && eq.latex && eq.latex.trim()){
       const tex = eq.latex;
-      return `<span class="eq-inline" data-tex="${escAttr(tex)}">$$${escHtml(tex)}$$</span>`;
+      // INLINE: \( ... \)
+      return `<span class="eq-inline" data-tex="${escAttr(tex)}">\\(${escHtml(tex)}\\)</span>`;
     }
     if (eq && eq.mathml && eq.mathml.trim()){
-      return `<span class="eq-inline" data-has-mml="1">${eq.mathml}</span>`;
+      return `<span class="eq-inline" data-has-mml="1">${forceInlineMathML(eq.mathml)}</span>`;
     }
     return `<span class="eq-inline-missing" title="${escAttr(rid || (eq && eq.error) || 'missing')}">[công&nbsp;thức]</span>`;
   };
@@ -194,7 +198,7 @@ function buildInlineHtml(documentXml, equations){
       out.push(renderEqInline(eqByRid[rid], rid)); return;
     }
 
-    // Walk children in typical Word order
+    // Walk children (đảm bảo thứ tự đoạn/run)
     if (node["w:p"]) toArr(node["w:p"]).forEach(ch => walk(ch, out));
     if (node["w:r"]) toArr(node["w:r"]).forEach(ch => walk(ch, out));
 
